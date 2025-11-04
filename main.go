@@ -2,81 +2,111 @@ package main
 
 import (
 	"fmt"
-	"net/http"
-	"strconv"
-	"strings"
+	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/mr-karan/balance"
 	"github.com/spf13/pflag"
+	"github.com/valyala/fasthttp"
 )
 
-const VERSION = "1.0"
+const (
+	Version                  = "1.0"
+	BadFailedRate            = 0.5
+	BadAverageResponseTimeMs = 1900.0
+	TestRounds               = 3
+	TestRequestsPerRound     = 5
+)
 
-func main() {
-	fmt.Printf("--- :LiveProxy %s: ---\n", VERSION)
-	fmt.Println("--- Parsing CLI arguments --backend<weight> ---")
+var upstreamSender = fasthttp.Client{
+	MaxConnWaitTimeout: 5 * time.Second,
+	ReadTimeout:        5 * time.Second,
+	WriteTimeout:       5 * time.Second,
+}
 
+func getBalancerWithValidUpstreams(upstreams []Upstream) *balance.Balance {
 	balancer := balance.NewBalance()
 
-	i := 0
-	for {
-		i++
-
-		full := fmt.Sprintf("backend%d", i)
-		usage := fmt.Sprintf("--backend<id> <weight:host:port>")
-
-		arg := pflag.StringP(full, "", "", usage)
-
-		if arg == nil || *arg == "" {
-			break
-		}
-
-		segments := strings.Split(*arg, ":")
-		if len(segments) != 3 {
-			fmt.Printf("%s: invalid backend, format: weight:host:port\n", *arg)
-			continue
-		}
-
-		weight, err := strconv.Atoi(segments[0])
-		if err != nil {
-			fmt.Printf("%s: invalid weight: %s\n", *arg, err)
-			continue
-		}
-		host := segments[1]
-		port, err := strconv.Atoi(segments[1])
-		if err != nil {
-			fmt.Printf("%s: invalid port: %s\n", *arg, err)
-			continue
-		}
-
-		target := fmt.Sprintf("%s:%d/", host, port)
-
-		fmt.Printf("Checking with GET %s... ", target)
-
-		_, err = http.Get(target)
-		if err != nil {
-			fmt.Println("error")
-			continue
-		}
-		fmt.Println("OK")
-
-		err = balancer.Add(target, weight)
-		if err != nil {
-			fmt.Printf("%s: cannot add to load balancer %v\n", *arg, err)
+	for _, upstream := range upstreams {
+		fmt.Printf("Testing %s:%d...", upstream.Host, upstream.Port)
+		quality := upstream.Test(TestRounds, TestRequestsPerRound)
+		fmt.Printf(" quality=(fails=%f, avg=%f)", quality.FailedRate, quality.AverageResponseTimeMs)
+		if quality.FailedRate > BadFailedRate {
+			fmt.Printf(" => bad upstream (fails > %v)\n", BadFailedRate)
+		} else if quality.AverageResponseTimeMs > BadAverageResponseTimeMs {
+			fmt.Printf(" => bad upstream (avg > %v)\n", BadAverageResponseTimeMs)
+		} else {
+			fmt.Printf(" => OK")
+			err := balancer.Add(upstream.Base(), upstream.Weight)
+			if err != nil {
+				fmt.Printf(", but cannot add to balancer: %v\n", err)
+			} else {
+				fmt.Printf(", added to balancer\n")
+			}
 		}
 	}
 
-	r := gin.Default()
-	_ = r.SetTrustedProxies(nil)
+	return balancer
+}
 
-	// Define a simple GET endpoint
-	r.GET("/*path", func(c *gin.Context) {
+func handle(upstream string, ctx *fasthttp.RequestCtx) {
+	method := string(ctx.Method())
+	path := string(ctx.Path())
 
-		c.JSON(http.StatusOK, gin.H{
-			"path": c.Param("path"),
-		})
+	bodyReader := ctx.Request.BodyStream()
+
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.Header.SetMethod(method)
+	req.SetRequestURI(upstream + path)
+	for k, v := range ctx.Request.Header.All() {
+		req.Header.SetBytesKV(k, v)
+	}
+	req.SetBodyStream(bodyReader, ctx.Request.Header.ContentLength())
+
+	if err := upstreamSender.Do(req, resp); err != nil {
+		fmt.Printf("%s %s /-->/ %s (%v)\n", method, path, upstream, err)
+
+		ctx.Error(fmt.Sprintf("LiveProxy error: %v", err), fasthttp.StatusBadGateway)
+		return
+	}
+
+	ctx.Response.SetStatusCode(resp.StatusCode())
+	for k, v := range resp.Header.All() {
+		ctx.Response.Header.SetBytesKV(k, v)
+	}
+
+	fmt.Printf("%s %s --> %s\n", method, path, upstream)
+}
+
+func main() {
+	fmt.Printf("--- :LiveProxy %s: ---\n\n", Version)
+	fmt.Printf("Parsing CLI arguments --host, --port, --upstream {weight}:{host}:{port}...\n")
+
+	host := pflag.String("host", "localhost", "listen host")
+	port := pflag.Uint16("port", 8080, "listen port")
+	upstreamEntries := pflag.StringArray("upstream", make([]string, 0), "{weight}:{host}:{port}")
+	pflag.Parse()
+
+	fmt.Printf("%d upstreams found, checking...\n", len(*upstreamEntries))
+
+	upstreams := ParseManyFromString(*upstreamEntries, func(mangled string, err error) {
+		fmt.Printf("%s ignored (parsing error): %s\n", mangled, err)
 	})
+	balancer := getBalancerWithValidUpstreams(upstreams)
+	listen := fmt.Sprintf("%s:%d", *host, *port)
 
-	r.Run()
+	fmt.Printf("Tests completed. Valid upstreams count: %d\n", len(balancer.ItemIDs()))
+	fmt.Printf("Starting FastHTTP server at %s\n", listen)
+
+	if err := fasthttp.ListenAndServe(
+		listen,
+		func(ctx *fasthttp.RequestCtx) {
+			handle(balancer.Get(), ctx)
+		},
+	); err != nil {
+		fmt.Printf("Error in ListenAndServe: %v\n", err)
+	}
 }
